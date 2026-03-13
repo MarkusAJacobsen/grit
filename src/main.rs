@@ -22,6 +22,12 @@ enum View {
     DiffView,
 }
 
+#[derive(PartialEq)]
+enum DiffFocus {
+    Content,
+    FilePane,
+}
+
 enum DiffLine {
     Context(String),
     Changed {
@@ -51,6 +57,9 @@ struct App {
     diff_scroll: usize,
     diff_total_lines: usize,
     diff_viewport_height: usize,
+    diff_focus: DiffFocus,
+    file_pane_open: bool,
+    file_pane_state: ListState,
 }
 
 fn main() -> color_eyre::Result<()> {
@@ -100,6 +109,9 @@ fn run(terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         diff_scroll: 0,
         diff_total_lines: 0,
         diff_viewport_height: 0,
+        diff_focus: DiffFocus::Content,
+        file_pane_open: false,
+        file_pane_state: ListState::default(),
     };
 
     loop {
@@ -117,6 +129,8 @@ fn run(terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
                                 app.diff_total_lines = compute_total_lines(&diff);
                                 app.diff = Some(diff);
                                 app.diff_scroll = 0;
+                                app.diff_focus = DiffFocus::Content;
+                                app.file_pane_state.select(Some(0));
                                 app.view = View::DiffView;
                             }
                         }
@@ -125,31 +139,85 @@ fn run(terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
                 },
                 View::DiffView => match key.code {
                     KeyCode::Char('q') => break,
-                    KeyCode::Esc | KeyCode::Left => {
-                        app.view = View::CommitList;
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let max_scroll = app.diff_total_lines
-                            .saturating_sub(app.diff_viewport_height);
-                        app.diff_scroll = (app.diff_scroll + 1).min(max_scroll);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        app.diff_scroll = app.diff_scroll.saturating_sub(1);
-                    }
-                    KeyCode::Char('e') => {
-                        if let Some(diff) = &mut app.diff {
-                            for file in &mut diff.files {
-                                file.collapsed = false;
+                    KeyCode::Char('f') => {
+                        match (app.file_pane_open, &app.diff_focus) {
+                            // Pane closed → open and focus it
+                            (false, _) => {
+                                app.file_pane_open = true;
+                                app.diff_focus = DiffFocus::FilePane;
                             }
-                            app.diff_total_lines = compute_total_lines(diff);
+                            // Pane open, focus on content → re-focus pane
+                            (true, DiffFocus::Content) => {
+                                app.diff_focus = DiffFocus::FilePane;
+                            }
+                            // Pane open, focus already on pane → close it
+                            (true, DiffFocus::FilePane) => {
+                                app.file_pane_open = false;
+                                app.diff_focus = DiffFocus::Content;
+                            }
                         }
                     }
-                    _ => {}
+                    code => match app.diff_focus {
+                        DiffFocus::FilePane => match code {
+                            KeyCode::Esc | KeyCode::Left => {
+                                app.diff_focus = DiffFocus::Content;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.file_pane_state.select_next();
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.file_pane_state.select_previous();
+                            }
+                            KeyCode::Enter => {
+                                if let (Some(diff), Some(idx)) =
+                                    (&app.diff, app.file_pane_state.selected())
+                                {
+                                    let target = file_start_line(diff, idx);
+                                    let max_scroll = app
+                                        .diff_total_lines
+                                        .saturating_sub(app.diff_viewport_height);
+                                    app.diff_scroll = target.min(max_scroll);
+                                }
+                                app.diff_focus = DiffFocus::Content;
+                            }
+                            _ => {}
+                        },
+                        DiffFocus::Content => match code {
+                            KeyCode::Esc | KeyCode::Left => {
+                                app.view = View::CommitList;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let max_scroll = app
+                                    .diff_total_lines
+                                    .saturating_sub(app.diff_viewport_height);
+                                app.diff_scroll = (app.diff_scroll + 1).min(max_scroll);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.diff_scroll = app.diff_scroll.saturating_sub(1);
+                            }
+                            KeyCode::Char('e') => {
+                                if let Some(diff) = &mut app.diff {
+                                    for file in &mut diff.files {
+                                        file.collapsed = false;
+                                    }
+                                    app.diff_total_lines = compute_total_lines(diff);
+                                }
+                            }
+                            _ => {}
+                        },
+                    },
                 },
             }
         }
     }
     Ok(())
+}
+
+fn file_start_line(diff: &CommitDiff, file_idx: usize) -> usize {
+    diff.files[..file_idx]
+        .iter()
+        .map(|f| 1 + if f.collapsed { 1 } else { f.rows.len() })
+        .sum()
 }
 
 fn load_diff(repo: &gix::Repository, oid: gix::ObjectId) -> color_eyre::Result<CommitDiff> {
@@ -219,7 +287,6 @@ fn process_change(
         .map(|id| repo.find_object(id).map(|o| o.data.to_vec()))
         .transpose()?;
 
-    // Skip binary files
     let is_binary = |bytes: &[u8]| bytes.contains(&0u8);
     if old_bytes.as_deref().map_or(false, is_binary)
         || new_bytes.as_deref().map_or(false, is_binary)
@@ -228,9 +295,11 @@ fn process_change(
     }
 
     let old_text = std::str::from_utf8(old_bytes.as_deref().unwrap_or_default())
-        .unwrap_or("").to_owned();
+        .unwrap_or("")
+        .to_owned();
     let new_text = std::str::from_utf8(new_bytes.as_deref().unwrap_or_default())
-        .unwrap_or("").to_owned();
+        .unwrap_or("")
+        .to_owned();
 
     files.push(compute_file_diff(path, &old_text, &new_text));
     Ok(Action::Continue)
@@ -296,6 +365,33 @@ fn compute_file_diff(path: String, old_text: &str, new_text: &str) -> FileDiff {
         rows,
         collapsed,
     }
+}
+
+fn wrap_path(path: &str, max_width: usize) -> Vec<String> {
+    if max_width < 3 {
+        return vec![format!(" {}", path)];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut remaining = path;
+    let mut first = true;
+    while !remaining.is_empty() {
+        let prefix = if first { " " } else { "  " };
+        let avail = max_width.saturating_sub(prefix.len());
+        if avail == 0 { break; }
+        if remaining.len() <= avail {
+            lines.push(format!("{}{}", prefix, remaining));
+            break;
+        }
+        // Break at the last '/' within the available width; fall back to a hard break.
+        let break_at = remaining[..avail]
+            .rfind('/')
+            .map(|i| i + 1)
+            .unwrap_or(avail);
+        lines.push(format!("{}{}", prefix, &remaining[..break_at]));
+        remaining = &remaining[break_at..];
+        first = false;
+    }
+    lines
 }
 
 fn compute_total_lines(diff: &CommitDiff) -> usize {
@@ -401,21 +497,64 @@ fn render_diff(frame: &mut Frame, app: &mut App) {
         .selected()
         .map(|i| app.commits[i].hash.as_str())
         .unwrap_or("");
+    let pane_hint = if app.file_pane_open { "f: hide files" } else { "f: show files" };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(format!(" {} ", hash)),
-            Span::styled("Esc/← to return", Style::new().dim()),
+            Span::styled("Esc/← return  ", Style::new().dim()),
+            Span::styled(pane_hint, Style::new().dim()),
         ])),
         title_area,
     );
 
-    let [left_area, right_area] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(body_area);
+    let (file_area, left_area, right_area) = if app.file_pane_open {
+        let areas = Layout::horizontal([
+            Constraint::Percentage(20),
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
+        ])
+        .split(body_area);
+        (Some(areas[0]), areas[1], areas[2])
+    } else {
+        let areas = Layout::horizontal([
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
+        ])
+        .split(body_area);
+        (None, areas[0], areas[1])
+    };
 
-    let inner_height = body_area.height.saturating_sub(2) as usize;
+    let inner_height = left_area.height.saturating_sub(2) as usize;
     app.diff_viewport_height = inner_height;
 
+    if let (Some(area), Some(diff)) = (file_area, &app.diff) {
+        let focused = app.diff_focus == DiffFocus::FilePane;
+        let max_width = area.width.saturating_sub(4) as usize;
+        let items: Vec<ListItem> = diff
+            .files
+            .iter()
+            .map(|f| {
+                let mut text_lines: Vec<Line<'static>> = wrap_path(&f.path, max_width)
+                    .into_iter()
+                    .map(Line::raw)
+                    .collect();
+                text_lines.push(Line::styled(
+                    format!("  +{} -{}", f.lines_added, f.lines_removed),
+                    Style::new().dim(),
+                ));
+                ListItem::new(ratatui::text::Text::from(text_lines))
+            })
+            .collect();
+        let title = if focused { "Files (j/k Enter)" } else { "Files (f)" };
+        let block = Block::bordered().title(title);
+        let list = List::new(items)
+            .block(block)
+            .highlight_symbol("> ")
+            .highlight_style(Style::new().bold().fg(Color::Yellow));
+        frame.render_stateful_widget(list, area, &mut app.file_pane_state);
+    }
+
+    // Diff columns
     if let Some(diff) = &app.diff {
         let (left_lines, right_lines) = build_render_lines(diff, app.diff_scroll, inner_height);
         frame.render_widget(
